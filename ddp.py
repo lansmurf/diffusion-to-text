@@ -323,49 +323,41 @@ def train(rank, world_size):
                 embeddings = embedding_layer(input_ids)  # Original clean embeddings (L(y))
 
                 # Randomly sample a starting timestep and define a range
-                t_start = np.random.randint(0, 1200 - 5)
-                # Ensure there's room for 5 subsequent timesteps
-                timesteps_range = range(t_start, t_start + 5)
+                t = np.random.randint(0, 1200)
+                # Add Gaussian noise based on the timestep
+                gaussian_noise = torch.randn_like(embeddings) * square_root_noise_schedule(t)
+                gaussian_noise_utterance = torch.randn_like(embeddings) * square_root_noise_schedule(t)
+                noisy_embeddings = embeddings + gaussian_noise
 
-                total_loss = 0
-                for t in timesteps_range:
-                    # Add Gaussian noise based on the timestep
-                    gaussian_noise = torch.randn_like(embeddings) * square_root_noise_schedule(t)
-                    gaussian_noise_utterance = torch.randn_like(embeddings) * square_root_noise_schedule(t)
-                    noisy_embeddings = embeddings + gaussian_noise
+                # Denoise the noisy embeddings
+                denoised_embeddings, predicted_noise = denoiser(noisy_embeddings=noisy_embeddings,
+                                                                encoded_utterance=gaussian_noise_utterance, t=t)
 
-                    # Denoise the noisy embeddings
-                    denoised_embeddings, predicted_noise = denoiser(noisy_embeddings=noisy_embeddings,
-                                                                    encoded_utterance=gaussian_noise_utterance, t=t)
+                # Calculate the noise prediction error
+                noise_prediction_error = F.mse_loss(predicted_noise, gaussian_noise)
 
-                    # Calculate the noise prediction error
-                    noise_prediction_error = F.mse_loss(predicted_noise, gaussian_noise)
+                # Decode the denoised embeddings to obtain the final decoded embeddings (D_s)
+                decoded_embeddings = decoder(denoised_embeddings, encoded_utterance=gaussian_noise_utterance)
 
-                    # Decode the denoised embeddings to obtain the final decoded embeddings (D_s)
-                    decoded_embeddings = decoder(denoised_embeddings, encoded_utterance=gaussian_noise_utterance)
+                # Calculate the embedding reconstruction error
+                reconstruction_error = F.mse_loss(decoded_embeddings, embeddings)
 
-                    # Calculate the embedding reconstruction error
-                    reconstruction_error = F.mse_loss(decoded_embeddings, embeddings)
-
-                    # Accumulate the losses for this timestep within the range
-                    timestep_loss = noise_prediction_error + reconstruction_error
-                    total_loss += timestep_loss
+                # Accumulate the losses for this timestep within the range
+                timestep_loss = noise_prediction_error + reconstruction_error
 
                 # Scale the accumulated loss from the sequential timesteps
-                scaled_loss = scaler.scale(total_loss)
+                scaled_loss = scaler.scale(timestep_loss)
                 scaled_loss.backward()
                 scaler.step(optimizer)  # Optimizer step after processing the sequential timesteps
                 scaler.update()
 
-                avg_loss = total_loss / 5  # Average loss over the sequential timesteps
-
                 total_loop_time = time.time() - start_time
-                print(f"Batch {batch_index}: Total iteration time: {total_loop_time:.3f}s")
+                print(f"aaBatch {batch_index}: Total iteration time: {total_loop_time:.3f}s")
 
                 if rank == 0:  # Only the first process logs the information
                     loop.set_description(f'Epoch [{epoch}/{num_epochs}]')
-                    loop.set_postfix(loss=avg_loss.item())
-                    wandb.log({"loss": avg_loss.item()})
+                    loop.set_postfix(loss=timestep_loss.item())
+                    wandb.log({"loss": timestep_loss.item()})
 
     dist.destroy_process_group()  # Clean up
 
